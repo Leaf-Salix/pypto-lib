@@ -659,7 +659,6 @@ def prefill_layer(
         chunk_len_b = pl.tensor.read(chunk_lens, [b])
         chunk_start = seq_len_b - chunk_len_b
         tok_blocks = (chunk_len_b + TOK_TILE - 1) // TOK_TILE
-        qkv_prev_tids = pl.array.create(2, pl.TASK_ID)
         for p0_idx in pl.range(tok_blocks):
             with pl.scope():
                 p0 = p0_idx * TOK_TILE
@@ -670,7 +669,12 @@ def prefill_layer(
                 normed_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.BF16)
 
                 # Stage 1.1: RMSNorm (vector ops).
-                for rms_core in pl.spmd(RMSNORM_SPMD_BLOCKS, name_hint="rmsnorm_spmd"):
+                with pl.spmd(
+                    RMSNORM_SPMD_BLOCKS,
+                    name_hint="rmsnorm_spmd",
+                    allow_early_resolve=True,
+                ) as rms_tid:
+                    rms_core = pl.tile.get_block_idx()
                     for work_id in pl.range(rms_core, RMSNORM_WORK_ITEMS, RMSNORM_SPMD_BLOCKS):
                         ti0 = work_id * RMSNORM_TOK_GROUP
                         if ti0 < valid_tok:
@@ -716,6 +720,10 @@ def prefill_layer(
                                     [ti0, k0],
                                 )
 
+                qkv_gate_tid = pl.system.task_invalid()
+                if p0_idx != 0:
+                    qkv_gate_tid = pl.system.task_dummy(deps=[rms_tid])
+
                 # Stage 1.2/1.3: Q/K/V projection.
                 q_proj_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.FP32)
                 k_proj_tile = pl.create_tensor([TOK_TILE, KV_HIDDEN], dtype=pl.FP32)
@@ -723,7 +731,7 @@ def prefill_layer(
                 with pl.spmd(
                     Q_PROJ_SPMD_BLOCKS,
                     name_hint="q_proj_spmd",
-                    deps=[qkv_prev_tids[0], qkv_prev_tids[1]],
+                    deps=[qkv_gate_tid],
                 ) as q_proj_tid:
                     q_core = pl.tile.get_block_idx()
                     for ob in pl.range(q_core, Q_OUT_BLOCKS, Q_PROJ_SPMD_BLOCKS):
@@ -741,7 +749,7 @@ def prefill_layer(
                 with pl.spmd(
                     KV_PROJ_SPMD_BLOCKS,
                     name_hint="kv_proj_spmd",
-                    deps=[qkv_prev_tids[0], qkv_prev_tids[1]],
+                    deps=[qkv_gate_tid],
                 ) as kv_proj_tid:
                     kv_core = pl.tile.get_block_idx()
                     for ob in pl.range(kv_core, KV_OUT_BLOCKS, KV_PROJ_SPMD_BLOCKS):
@@ -1140,9 +1148,6 @@ def prefill_layer(
                             valid_shape=[valid_tok, K_CHUNK],
                         )
                         out = pl.assemble(out, out_chunk_valid, [token_p0, d0])
-
-                qkv_prev_tids[0] = q_proj_tid
-                qkv_prev_tids[1] = kv_proj_tid
 
     return out
 
