@@ -1149,7 +1149,7 @@ def prefill_layer(
                     DOWN_RESID_SPMD_BLOCKS,
                     name_hint="mlp_stream_out_cast_spmd",
                     deps=[down_chain[0]],
-                ):
+                ) as cast_tid:
                     cast_core = pl.tile.get_block_idx()
                     for hb in pl.range(cast_core, HIDDEN_BLOCKS, DOWN_RESID_SPMD_BLOCKS):
                         h0 = hb * K_CHUNK
