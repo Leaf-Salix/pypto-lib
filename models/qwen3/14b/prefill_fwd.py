@@ -1139,38 +1139,41 @@ def prefill_layer(
     # scope-local buffers, so band0/band1 pipeline (band1's gate overlaps band0's
     # silu/down) and the atomic RMW does the cross-band down reduction with no
     # barrier; a final cast writes bf16 `out`.
-    mlp_out_acc = pl.create_tensor([toks_pad, HIDDEN], dtype=pl.FP32, manual_dep=True)
     down_n_blocks = HIDDEN // K_CHUNK
     band_k_chunks = MLP_BAND_WIDTH // MLP_OUT_CHUNK
     silu_band_blocks = MLP_BAND_WIDTH // SILU_OUT_CHUNK
 
     # Seed + gate/up/silu/down + cast are FUSED into ONE per-m-tile scope. This is
-    # deliberate: mlp_out_acc is manual_dep=True (ALL of its auto RAW/WAR/WAW edges
+    # deliberate: mlp_out_acc_tile is manual_dep=True (ALL of its auto RAW/WAR/WAW edges
     # are OFF), so the two orderings we DO need -- seed -> down and down -> cast --
     # must be pinned with explicit TASK_ID deps, and an explicit dep may only name a
     # tid captured in an ENCLOSING scope (a tid from a sibling `for mt` loop is a
     # free var -> SSA verify fails). Keeping seed_tid / down_tid in the same m-tile
     # scope as their consumers is what makes those edges legal. The one edge we
     # SUPPRESS is band0 <-> band1 down: both bands dep only on seed_tid, never on
-    # each other, so their atomic-adds into mlp_out_acc run concurrently -- the
+    # each other, so their atomic-adds into mlp_out_acc_tile run concurrently -- the
     # atomic RMW makes the cross-band reduction order-independent (that WAW removal
     # is the whole point).
     for mt in pl.range(num_m_tiles):
         m0 = mt * MLP_M_TILE
         with pl.scope():
+            mlp_out_acc_tile = pl.create_tensor(
+                [MLP_M_TILE, HIDDEN], dtype=pl.FP32, manual_dep=True
+            )
+
             # Seed the accumulator with the first-residual (folds the MLP residual add).
             with pl.spmd(DOWN_RESID_SPMD_BLOCKS, name_hint="mlp_out_seed_spmd") as seed_tid:
                 seed_core = pl.tile.get_block_idx()
                 for hb in pl.range(seed_core, down_n_blocks, DOWN_RESID_SPMD_BLOCKS):
                     h0 = hb * K_CHUNK
-                    mlp_out_acc = pl.assemble(
-                        mlp_out_acc,
+                    mlp_out_acc_tile = pl.assemble(
+                        mlp_out_acc_tile,
                         pl.slice(resid1_all, [MLP_M_TILE, K_CHUNK], [m0, h0]),
-                        [m0, h0],
+                        [0, h0],
                     )
 
             # down_chain collects each band's down TASK_ID in THIS m-tile scope so the
-            # post-band cast can gate on ALL bands' atomic-adds (mlp_out_acc is
+            # post-band cast can gate on ALL bands' atomic-adds (mlp_out_acc_tile is
             # manual_dep, so the down -> cast edge is explicit, not auto-tracked). It
             # is NOT a serialization chain -- the bands never dep on each other.
             down_chain = pl.array.create(MLP_PROJ_BANDS, pl.TASK_ID)
@@ -1237,10 +1240,15 @@ def prefill_layer(
                                 msi = pl.slice(mlp_silu_b, [MLP_M_TILE, MLP_OUT_CHUNK], [0, c0])
                                 wdi = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [layer_inter_base + band_inter0 + c0, h0])
                                 down_acc = pl.matmul_acc(down_acc, msi, wdi)
-                            mlp_out_acc = pl.assemble(mlp_out_acc, down_acc, [m0, h0], atomic=pl.AtomicType.Add)
+                            mlp_out_acc_tile = pl.assemble(
+                                mlp_out_acc_tile,
+                                down_acc,
+                                [0, h0],
+                                atomic=pl.AtomicType.Add,
+                            )
                     down_chain[mlp_band] = down_tid
 
-            # Cast the FP32 accumulator to bf16 `out`. mlp_out_acc is manual_dep, so
+            # Cast the FP32 accumulator to bf16 `out`. mlp_out_acc_tile is manual_dep, so
             # this read is gated on BOTH bands' down adds explicitly (auto-dep is off).
             # This is the only down -> consumer edge; it does NOT reintroduce any
             # band0 <-> band1 ordering.
@@ -1249,7 +1257,7 @@ def prefill_layer(
                 cast_core = pl.tile.get_block_idx()
                 for hb in pl.range(cast_core, down_n_blocks, DOWN_RESID_SPMD_BLOCKS):
                     h0 = hb * K_CHUNK
-                    acc_chunk = pl.slice(mlp_out_acc, [MLP_M_TILE, K_CHUNK], [m0, h0])
+                    acc_chunk = pl.slice(mlp_out_acc_tile, [MLP_M_TILE, K_CHUNK], [0, h0])
                     out_bf = pl.cast(acc_chunk, target_type=pl.BF16)
                     out_valid = pl.slice(out_bf, [MLP_M_TILE, K_CHUNK], [0, 0], valid_shape=[valid_tt, K_CHUNK])
                     out = pl.assemble(out, out_valid, [m0, h0])
@@ -1300,25 +1308,26 @@ def prefill_fwd(
     prefill_tokens = pl.tensor.dim(input_ids, 0)
 
     hidden_states = pl.create_tensor([prefill_tokens, HIDDEN], dtype=pl.BF16)
-    for p0 in pl.parallel(0, prefill_tokens, TOK_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="token_embed"):
-            valid_tok = pl.min(TOK_TILE, prefill_tokens - p0)
-            for ti in pl.range(TOK_TILE):
-                if ti < valid_tok:
-                    token_idx = p0 + ti
-                    token_id = pl.tensor.read(input_ids, [token_idx])
-                    token_row = pl.cast(token_id, target_type=pl.INDEX)
-                    for k0 in pl.range(0, HIDDEN, EMBED_HIDDEN_CHUNK):
-                        hidden_chunk = pl.slice(
-                            embed_weight,
-                            [1, EMBED_HIDDEN_CHUNK],
-                            [token_row, k0],
-                        )
-                        hidden_states = pl.assemble(
-                            hidden_states,
-                            hidden_chunk,
-                            [token_idx, k0],
-                        )
+    with pl.scope():
+        for p0 in pl.parallel(0, prefill_tokens, TOK_TILE):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="token_embed"):
+                valid_tok = pl.min(TOK_TILE, prefill_tokens - p0)
+                for ti in pl.range(TOK_TILE):
+                    if ti < valid_tok:
+                        token_idx = p0 + ti
+                        token_id = pl.tensor.read(input_ids, [token_idx])
+                        token_row = pl.cast(token_id, target_type=pl.INDEX)
+                        for k0 in pl.range(0, HIDDEN, EMBED_HIDDEN_CHUNK):
+                            hidden_chunk = pl.slice(
+                                embed_weight,
+                                [1, EMBED_HIDDEN_CHUNK],
+                                [token_row, k0],
+                            )
+                            hidden_states = pl.assemble(
+                                hidden_states,
+                                hidden_chunk,
+                                [token_idx, k0],
+                            )
 
     for layer_idx in pl.range(num_layers_actual):
         with pl.scope():
