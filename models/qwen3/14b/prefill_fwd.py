@@ -113,6 +113,7 @@ QKPV_TOK_BATCH = 4
 QKPV_BATCH_ROWS = QKPV_TOK_BATCH * Q_HEAD_PAD
 SB_BATCH = 64
 MLP_OUT_CHUNK = 256  # 512B cache line: gate/up weight-N inner + down_proj activation inner
+MLP_SILU_CHUNK = 64
 LM_HEAD_K_CHUNK = 128
 VOCAB_CHUNK = 64
 HIDDEN_BLOCKS = HIDDEN // K_CHUNK
@@ -1116,12 +1117,18 @@ def prefill_layer(
                                 wui = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + k0, o0])
                                 up_acc = pl.matmul_acc(up_acc, pci, wui)
 
-                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mlp_stream_silu"):
-                            sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
-                            mlp_chunk_bf16 = pl.cast(
-                                pl.mul(pl.mul(gate_acc, sigmoid), up_acc),
-                                target_type=pl.BF16,
-                            )
+                        mlp_chunk_bf16 = pl.create_tensor([TOK_TILE, MLP_OUT_CHUNK], dtype=pl.BF16)
+                        for silu_o0 in pl.range(0, MLP_OUT_CHUNK, MLP_SILU_CHUNK):
+                            with pl.at(level=pl.Level.CORE_GROUP, name_hint="mlp_stream_silu"):
+                                silu_gate = pl.slice(gate_acc, [TOK_TILE, MLP_SILU_CHUNK], [0, silu_o0])
+                                silu_up = pl.slice(up_acc, [TOK_TILE, MLP_SILU_CHUNK], [0, silu_o0])
+                                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(silu_gate)), 1.0))
+                                mlp_chunk = pl.mul(pl.mul(silu_gate, sigmoid), silu_up)
+                                mlp_chunk_bf16 = pl.assemble(
+                                    mlp_chunk_bf16,
+                                    pl.cast(mlp_chunk, target_type=pl.BF16),
+                                    [0, silu_o0],
+                                )
 
                         with pl.spmd(
                             DOWN_PROJ_SPMD_BLOCKS,
