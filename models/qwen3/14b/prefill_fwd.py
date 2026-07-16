@@ -115,32 +115,12 @@ SB_BATCH = 64
 MLP_OUT_CHUNK = 256  # 512B cache line: gate/up weight-N inner + down_proj activation inner
 LM_HEAD_K_CHUNK = 128
 VOCAB_CHUNK = 64
-DOWN_K_PARTS = 3
 HIDDEN_BLOCKS = HIDDEN // K_CHUNK
 Q_OUT_BLOCKS = HIDDEN // Q_OUT_CHUNK
 KV_OUT_BLOCKS = KV_HIDDEN // KV_OUT_CHUNK
 MLP_OUT_BLOCKS = INTERMEDIATE // MLP_OUT_CHUNK
-# Vector epilogues (silu, down+residual) are UB-bound, not cube-bound: a 256-wide
-# fp32 frag overflows the 184KB Vec buffer. Decouple their frag from the 256 cube
-# tiles (K_CHUNK / MLP_OUT_CHUNK) — they read/write GM intermediates column-wise,
-# so a finer 128 frag is free of the cube's cache-line concern.
-# Route B: the phase-major MLP weight matmuls tile M at 128 (two 64-token tiles
-# at once) so each w_gate/w_up/w_down slab streams from HBM once and is reused
-# across 128 rows in L1/L0 — halves weight re-streaming vs the M=64 layout,
-# attacking the HBM-bound floor directly. L0C caps M*N*4 <= 128KB, so N stays 256
-# (=MLP_OUT_CHUNK, keeps the 512B weight cache line) exactly at the wall. The
-# vector epilogues (silu, down+resid) are UB-bound, so their frag drops to 64 to
-# fit the 184KB Vec buffer at M=128.
-MLP_M_TILE = 2 * TOK_TILE
-SILU_OUT_CHUNK = 64
-SILU_OUT_BLOCKS = INTERMEDIATE // SILU_OUT_CHUNK
 DOWN_RESID_CHUNK = 64
 DOWN_RESID_BLOCKS = HIDDEN // DOWN_RESID_CHUNK
-MLP_PROJ_BANDS = 2
-MLP_BAND_BLOCKS = MLP_OUT_BLOCKS // MLP_PROJ_BANDS
-MLP_BAND_WIDTH = MLP_BAND_BLOCKS * MLP_OUT_CHUNK
-DOWN_PART_BLOCKS = (MLP_OUT_BLOCKS + DOWN_K_PARTS - 1) // DOWN_K_PARTS
-DOWN_PART_WORK_ITEMS = HIDDEN_BLOCKS * DOWN_K_PARTS
 RMSNORM_TOK_GROUP = 8
 RMSNORM_TOK_GROUPS = (TOK_TILE + RMSNORM_TOK_GROUP - 1) // RMSNORM_TOK_GROUP
 RMSNORM_WORK_ITEMS = RMSNORM_TOK_GROUPS
@@ -151,18 +131,6 @@ QK_NORM_SPMD_BLOCKS = NUM_KV_HEADS
 POST_RMSNORM_SPMD_BLOCKS = 8
 DOWN_RESID_SPMD_BLOCKS = 20
 OUT_PROJ_SPMD_BLOCKS = 20
-SILU_SPMD_BLOCKS = 24
-# gate and up share ONE spmd so a core can pick up work from both projections.
-# Each projection has MLP_BAND_BLOCKS (34) N-tiles over GATE_UP_SPMD_BLOCKS (24)
-# cores, so H = 34 - 24 = 10 cores carry a 2nd tile per projection. If both
-# projections put their heavy tiles on the SAME cores (start = core), those 10
-# cores would run 4 tiles. Shifting up's core start by H moves up's heavy cores
-# (start < H) onto the gate-light cores, capping every core at 3 tiles:
-#   cores  0..9  -> 2 gate + 1 up = 3
-#   cores 10..13 -> 1 gate + 1 up = 2
-#   cores 14..23 -> 1 gate + 2 up = 3
-GATE_UP_SPMD_BLOCKS = 24
-UP_PROJ_CORE_SHIFT = MLP_BAND_BLOCKS - GATE_UP_SPMD_BLOCKS
 DOWN_PROJ_SPMD_BLOCKS = 24
 
 assert HIDDEN % EMBED_HIDDEN_CHUNK == 0
@@ -712,22 +680,9 @@ def prefill_layer(
     layer_cache_base = layer_idx * layer_cache_rows
     max_blocks_per_seq = pl.tensor.dim(block_table, 0) // user_batch
 
-    # ── Phase-major MLP staging ──
-    # The MLP weights (w_gate/w_up/w_down, ~178MB each) don't fit L2 alongside
-    # each other and are re-streamed from HBM once per tok_block in the fused
-    # tok-major layout. Split the layer: phase 1 (below) does the per-tok
-    # attention path up through post-attn RMSNorm and stores its two hand-offs
-    # (post_norm, first-residual) for the whole packed token dim; phase 2 (after
-    # the batch loop) runs gate/up/down as flat, band-grouped token-tile sweeps
-    # so each weight streams from HBM once and is reused across every token tile.
-    prefill_tokens = pl.tensor.dim(hidden_states, 0)
-    num_tok_tiles = (prefill_tokens + TOK_TILE - 1) // TOK_TILE
-    num_m_tiles = (prefill_tokens + MLP_M_TILE - 1) // MLP_M_TILE
-    # Pad to a multiple of MLP_M_TILE (>= num_tok_tiles*TOK_TILE), so both the
-    # phase-1 64-row writes and the phase-2 128-row MLP sweeps stay in bounds.
-    toks_pad = num_m_tiles * MLP_M_TILE
-    post_norm_all = pl.create_tensor([toks_pad, HIDDEN], dtype=pl.BF16)
-    resid1_all = pl.create_tensor([toks_pad, HIDDEN], dtype=pl.FP32)
+    # Stream the MLP from each attention tile instead of staging whole-chunk
+    # post_norm/resid buffers. This trades weight reuse for much smaller heap
+    # pressure: the MLP consumes one TOK_TILE window and immediately writes `out`.
 
     for b in pl.parallel(0, user_batch, 1):
         token_base = pl.cast(pl.tensor.read(chunk_offsets, [b]), pl.INDEX)
@@ -1045,10 +1000,7 @@ def prefill_layer(
                 # ── Scope 3: output projection + residual + post RMSNorm + MLP ──
                 # Stage 3.1: Output projection + first residual.
                 out_proj_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.FP32)
-                # In-place view into the packed first-residual buffer: writes land
-                # directly in resid1_all (persists across the parallel batch loop),
-                # instead of a functional copy that the phase-major MLP can't read.
-                resid1_tile = pl.slice(resid1_all, [TOK_TILE, HIDDEN], [token_p0, 0])
+                resid1_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.FP32)
                 for out_core in pl.spmd(OUT_PROJ_SPMD_BLOCKS, name_hint="out_proj_aic_spmd"):
                     for ob in pl.range(out_core, Q_OUT_BLOCKS, OUT_PROJ_SPMD_BLOCKS):
                         o0 = ob * Q_OUT_CHUNK
@@ -1076,12 +1028,11 @@ def prefill_layer(
                         out_proj_chunk = pl.slice(out_proj_tile, [TOK_TILE, Q_OUT_CHUNK], [0, o0])
                         resid1_tile = pl.assemble(resid1_tile, pl.add(out_proj_chunk, resid_chunk), [0, o0])
 
-                # Stage 3.2: Post-attention RMSNorm (writes in place into the packed
-                # post_norm buffer that the phase-major MLP below consumes).
-                post_norm_tile = pl.slice(post_norm_all, [TOK_TILE, HIDDEN], [token_p0, 0])
-                # allow_early_resolve: post_norm is the predecessor of the phase-2
-                # MLP gate/up, so flagging it lets those pre-stage onto idle cores the
-                # instant this norm finishes (the gate/up chain then orders bands).
+                # Stage 3.2: Post-attention RMSNorm.
+                post_norm_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.BF16)
+                # allow_early_resolve: post_norm feeds the streaming MLP gate/up,
+                # so flagging it lets those pre-stage onto idle cores once this norm
+                # finishes.
                 for post_core in pl.spmd(POST_RMSNORM_SPMD_BLOCKS, name_hint="post_rmsnorm_spmd", allow_early_resolve=True):
                     for work_id in pl.range(post_core, RMSNORM_WORK_ITEMS, POST_RMSNORM_SPMD_BLOCKS):
                         ti0 = work_id * RMSNORM_TOK_GROUP
@@ -1125,142 +1076,94 @@ def prefill_layer(
                                     [ti0, k0],
                                 )
 
+                # Stage 3.3: Streaming MLP. Process one intermediate chunk at a
+                # time and add its down-projection contribution into the tile-local
+                # accumulator, avoiding whole-chunk post_norm/resid/MLP staging.
+                mlp_out_acc_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.FP32)
+                with pl.spmd(DOWN_RESID_SPMD_BLOCKS, name_hint="mlp_stream_seed_spmd") as seed_tid:
+                    seed_core = pl.tile.get_block_idx()
+                    for hb in pl.range(seed_core, HIDDEN_BLOCKS, DOWN_RESID_SPMD_BLOCKS):
+                        h0 = hb * K_CHUNK
+                        mlp_out_acc_tile = pl.assemble(
+                            mlp_out_acc_tile,
+                            pl.slice(resid1_tile, [TOK_TILE, K_CHUNK], [0, h0]),
+                            [0, h0],
+                        )
+
+                down_chain = pl.array.create(1, pl.TASK_ID)
+                down_chain[0] = seed_tid
+                for ob in pl.range(MLP_OUT_BLOCKS):
+                    with pl.scope():
+                        o0 = ob * MLP_OUT_CHUNK
+
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mlp_stream_gate_proj"):
+                            pc0 = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, 0])
+                            wg0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, o0])
+                            gate_acc = pl.matmul(pc0, wg0, out_dtype=pl.FP32)
+                            for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
+                                k0 = kb * K_CHUNK
+                                pci = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, k0])
+                                wgi = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + k0, o0])
+                                gate_acc = pl.matmul_acc(gate_acc, pci, wgi)
+
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mlp_stream_up_proj"):
+                            pc0 = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, 0])
+                            wu0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, o0])
+                            up_acc = pl.matmul(pc0, wu0, out_dtype=pl.FP32)
+                            for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
+                                k0 = kb * K_CHUNK
+                                pci = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, k0])
+                                wui = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + k0, o0])
+                                up_acc = pl.matmul_acc(up_acc, pci, wui)
+
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mlp_stream_silu"):
+                            sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
+                            mlp_chunk_bf16 = pl.cast(
+                                pl.mul(pl.mul(gate_acc, sigmoid), up_acc),
+                                target_type=pl.BF16,
+                            )
+
+                        with pl.spmd(
+                            DOWN_PROJ_SPMD_BLOCKS,
+                            name_hint="mlp_stream_down_proj_spmd",
+                            deps=[down_chain[0]],
+                        ) as down_tid:
+                            down_core = pl.tile.get_block_idx()
+                            for hb in pl.range(down_core, HIDDEN_BLOCKS, DOWN_PROJ_SPMD_BLOCKS):
+                                h0 = hb * K_CHUNK
+                                w_down_chunk = pl.slice(
+                                    w_down,
+                                    [MLP_OUT_CHUNK, K_CHUNK],
+                                    [layer_inter_base + o0, h0],
+                                )
+                                down_acc = pl.matmul(mlp_chunk_bf16, w_down_chunk, out_dtype=pl.FP32)
+                                mlp_out_acc_tile = pl.assemble(
+                                    mlp_out_acc_tile,
+                                    down_acc,
+                                    [0, h0],
+                                    atomic=pl.AtomicType.Add,
+                                )
+                        down_chain[0] = down_tid
+
+                with pl.spmd(
+                    DOWN_RESID_SPMD_BLOCKS,
+                    name_hint="mlp_stream_out_cast_spmd",
+                    deps=[down_chain[0]],
+                ):
+                    cast_core = pl.tile.get_block_idx()
+                    for hb in pl.range(cast_core, HIDDEN_BLOCKS, DOWN_RESID_SPMD_BLOCKS):
+                        h0 = hb * K_CHUNK
+                        acc_chunk = pl.slice(mlp_out_acc_tile, [TOK_TILE, K_CHUNK], [0, h0])
+                        out_bf = pl.cast(acc_chunk, target_type=pl.BF16)
+                        out_valid = pl.slice(out_bf, [TOK_TILE, K_CHUNK], [0, 0], valid_shape=[valid_tok, K_CHUNK])
+                        out = pl.assemble(out, out_valid, [token_p0, h0])
+
                 # Chain the next tok-block's Q/K/V projection behind this block's
                 # so cross-block QKV deps stay ordered (q/kv_proj_tid live in this
                 # scope; qkv_prev_tids is the enclosing batch-level carrier array).
                 qkv_prev_tids[0] = q_proj_tid
                 qkv_prev_tids[1] = kv_proj_tid
 
-
-    # ── Phase 2: fully-fused per-band MLP (gate -> up -> silu -> down) ──
-    # For each (mt, band): compute gate/up (M=128, weight streamed once), SiLU on
-    # chip, then the band's down partial (contracting ONLY that band's intermediate
-    # columns) and atomic-add it into a residual-seeded FP32 accumulator. Bands own
-    # scope-local buffers, so band0/band1 pipeline (band1's gate overlaps band0's
-    # silu/down) and the atomic RMW does the cross-band down reduction with no
-    # barrier; a final cast writes bf16 `out`.
-    down_n_blocks = HIDDEN // K_CHUNK
-    band_k_chunks = MLP_BAND_WIDTH // MLP_OUT_CHUNK
-    silu_band_blocks = MLP_BAND_WIDTH // SILU_OUT_CHUNK
-
-    # Seed + gate/up/silu/down + cast are FUSED into ONE per-m-tile scope. This is
-    # deliberate: mlp_out_acc_tile is manual_dep=True (ALL of its auto RAW/WAR/WAW edges
-    # are OFF), so the two orderings we DO need -- seed -> down and down -> cast --
-    # must be pinned with explicit TASK_ID deps, and an explicit dep may only name a
-    # tid captured in an ENCLOSING scope (a tid from a sibling `for mt` loop is a
-    # free var -> SSA verify fails). Keeping seed_tid / down_tid in the same m-tile
-    # scope as their consumers is what makes those edges legal. The one edge we
-    # SUPPRESS is band0 <-> band1 down: both bands dep only on seed_tid, never on
-    # each other, so their atomic-adds into mlp_out_acc_tile run concurrently -- the
-    # atomic RMW makes the cross-band reduction order-independent (that WAW removal
-    # is the whole point).
-    for mt in pl.range(num_m_tiles):
-        m0 = mt * MLP_M_TILE
-        with pl.scope():
-            mlp_out_acc_tile = pl.create_tensor(
-                [MLP_M_TILE, HIDDEN], dtype=pl.FP32, manual_dep=True
-            )
-
-            # Seed the accumulator with the first-residual (folds the MLP residual add).
-            with pl.spmd(DOWN_RESID_SPMD_BLOCKS, name_hint="mlp_out_seed_spmd") as seed_tid:
-                seed_core = pl.tile.get_block_idx()
-                for hb in pl.range(seed_core, down_n_blocks, DOWN_RESID_SPMD_BLOCKS):
-                    h0 = hb * K_CHUNK
-                    mlp_out_acc_tile = pl.assemble(
-                        mlp_out_acc_tile,
-                        pl.slice(resid1_all, [MLP_M_TILE, K_CHUNK], [m0, h0]),
-                        [0, h0],
-                    )
-
-            # down_chain collects each band's down TASK_ID in THIS m-tile scope so the
-            # post-band cast can gate on ALL bands' atomic-adds (mlp_out_acc_tile is
-            # manual_dep, so the down -> cast edge is explicit, not auto-tracked). It
-            # is NOT a serialization chain -- the bands never dep on each other.
-            down_chain = pl.array.create(MLP_PROJ_BANDS, pl.TASK_ID)
-
-            for mlp_band in pl.range(MLP_PROJ_BANDS):
-                with pl.scope():
-                    band_ob0 = mlp_band * MLP_BAND_BLOCKS
-                    band_inter0 = mlp_band * MLP_BAND_WIDTH
-                    gate_acc_b = pl.create_tensor([MLP_M_TILE, MLP_BAND_WIDTH], dtype=pl.FP32)
-                    up_acc_b = pl.create_tensor([MLP_M_TILE, MLP_BAND_WIDTH], dtype=pl.FP32)
-                    mlp_silu_b = pl.create_tensor([MLP_M_TILE, MLP_BAND_WIDTH], dtype=pl.BF16)
-
-                    # gate + up fused into ONE spmd(24): each core services a strided
-                    # slice of BOTH projections. gate starts at `core`; up starts at
-                    # `(core + UP_PROJ_CORE_SHIFT) % 24` so the two heavy-core sets are
-                    # disjoint and no core exceeds 3 N-tiles (see const comment). The
-                    # strided starts are bijections of the core over 0..23, so together
-                    # they still cover rel_ob 0..MLP_BAND_BLOCKS-1 exactly once each.
-                    with pl.spmd(GATE_UP_SPMD_BLOCKS, name_hint="gate_up_proj_spmd") as gate_up_tid:
-                        gu_core = pl.tile.get_block_idx()
-                        for rel_ob in pl.range(gu_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
-                            o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
-                            pc0 = pl.slice(post_norm_all, [MLP_M_TILE, K_CHUNK], [m0, 0])
-                            wg0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, o0])
-                            gate_acc = pl.matmul(pc0, wg0, out_dtype=pl.FP32)
-                            for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
-                                k0 = kb * K_CHUNK
-                                pci = pl.slice(post_norm_all, [MLP_M_TILE, K_CHUNK], [m0, k0])
-                                wgi = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + k0, o0])
-                                gate_acc = pl.matmul_acc(gate_acc, pci, wgi)
-                            gate_acc_b = pl.assemble(gate_acc_b, gate_acc, [0, rel_ob * MLP_OUT_CHUNK])
-
-                        up_core = (gu_core + UP_PROJ_CORE_SHIFT) % GATE_UP_SPMD_BLOCKS
-                        for rel_ob in pl.range(up_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
-                            o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
-                            pc0 = pl.slice(post_norm_all, [MLP_M_TILE, K_CHUNK], [m0, 0])
-                            wu0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, o0])
-                            up_acc = pl.matmul(pc0, wu0, out_dtype=pl.FP32)
-                            for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
-                                k0 = kb * K_CHUNK
-                                pci = pl.slice(post_norm_all, [MLP_M_TILE, K_CHUNK], [m0, k0])
-                                wui = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + k0, o0])
-                                up_acc = pl.matmul_acc(up_acc, pci, wui)
-                            up_acc_b = pl.assemble(up_acc_b, up_acc, [0, rel_ob * MLP_OUT_CHUNK])
-
-                    for silu_core in pl.spmd(SILU_SPMD_BLOCKS, name_hint="silu_spmd"):
-                        for rel_sb in pl.range(silu_core, silu_band_blocks, SILU_SPMD_BLOCKS):
-                            so0 = rel_sb * SILU_OUT_CHUNK
-                            silu_gate = pl.slice(gate_acc_b, [MLP_M_TILE, SILU_OUT_CHUNK], [0, so0])
-                            silu_up = pl.slice(up_acc_b, [MLP_M_TILE, SILU_OUT_CHUNK], [0, so0])
-                            sigmoid = pl.recip(pl.add(pl.exp(pl.neg(silu_gate)), 1.0))
-                            mlp_chunk = pl.mul(pl.mul(silu_gate, sigmoid), silu_up)
-                            mlp_silu_b = pl.assemble(mlp_silu_b, pl.cast(mlp_chunk, target_type=pl.BF16), [0, so0])
-
-                    with pl.spmd(DOWN_PROJ_SPMD_BLOCKS, name_hint="down_proj_spmd", deps=[seed_tid]) as down_tid:
-                        down_core = pl.tile.get_block_idx()
-                        for hb in pl.range(down_core, down_n_blocks, DOWN_PROJ_SPMD_BLOCKS):
-                            h0 = hb * K_CHUNK
-                            ms0 = pl.slice(mlp_silu_b, [MLP_M_TILE, MLP_OUT_CHUNK], [0, 0])
-                            wd0 = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [layer_inter_base + band_inter0, h0])
-                            down_acc = pl.matmul(ms0, wd0, out_dtype=pl.FP32)
-                            for cb in pl.pipeline(1, band_k_chunks, stage=2):
-                                c0 = cb * MLP_OUT_CHUNK
-                                msi = pl.slice(mlp_silu_b, [MLP_M_TILE, MLP_OUT_CHUNK], [0, c0])
-                                wdi = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [layer_inter_base + band_inter0 + c0, h0])
-                                down_acc = pl.matmul_acc(down_acc, msi, wdi)
-                            mlp_out_acc_tile = pl.assemble(
-                                mlp_out_acc_tile,
-                                down_acc,
-                                [0, h0],
-                                atomic=pl.AtomicType.Add,
-                            )
-                    down_chain[mlp_band] = down_tid
-
-            # Cast the FP32 accumulator to bf16 `out`. mlp_out_acc_tile is manual_dep, so
-            # this read is gated on BOTH bands' down adds explicitly (auto-dep is off).
-            # This is the only down -> consumer edge; it does NOT reintroduce any
-            # band0 <-> band1 ordering.
-            valid_tt = pl.min(MLP_M_TILE, prefill_tokens - m0)
-            with pl.spmd(DOWN_RESID_SPMD_BLOCKS, name_hint="mlp_out_cast_spmd", deps=[down_chain[0], down_chain[1]]) as cast_tid:
-                cast_core = pl.tile.get_block_idx()
-                for hb in pl.range(cast_core, down_n_blocks, DOWN_RESID_SPMD_BLOCKS):
-                    h0 = hb * K_CHUNK
-                    acc_chunk = pl.slice(mlp_out_acc_tile, [MLP_M_TILE, K_CHUNK], [0, h0])
-                    out_bf = pl.cast(acc_chunk, target_type=pl.BF16)
-                    out_valid = pl.slice(out_bf, [MLP_M_TILE, K_CHUNK], [0, 0], valid_shape=[valid_tt, K_CHUNK])
-                    out = pl.assemble(out, out_valid, [m0, h0])
 
     return out
 
