@@ -1727,19 +1727,19 @@ def prefill_layer(
                         for out_core in pl.spmd(OUT_PROJ_SPMD_BLOCKS, name_hint="out_proj_band_aic_spmd"):
                             for ob in pl.range(out_core, Q_OUT_BLOCKS, OUT_PROJ_SPMD_BLOCKS):
                                 o0 = ob * Q_OUT_CHUNK
-                                tile_a = pl.slice(attn_band_tile, [FINALIZE_TOK_GROUP, K_CHUNK], [0, 0])
-                                tile_w = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base, o0])
-                                o_acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
+                                out_band_a = pl.slice(attn_band_tile, [FINALIZE_TOK_GROUP, K_CHUNK], [0, 0])
+                                out_band_w = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base, o0])
+                                out_band_acc = pl.matmul(out_band_a, out_band_w, out_dtype=pl.FP32)
                                 for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
                                     k0 = kb * K_CHUNK
-                                    tile_a_i = pl.slice(attn_band_tile, [FINALIZE_TOK_GROUP, K_CHUNK], [0, k0])
-                                    tile_w_i = pl.slice(
+                                    out_band_a_i = pl.slice(attn_band_tile, [FINALIZE_TOK_GROUP, K_CHUNK], [0, k0])
+                                    out_band_w_i = pl.slice(
                                         wo,
                                         [K_CHUNK, Q_OUT_CHUNK],
                                         [layer_hidden_base + k0, o0],
                                     )
-                                    o_acc = pl.matmul_acc(o_acc, tile_a_i, tile_w_i)
-                                out_proj_band = pl.assemble(out_proj_band, o_acc, [0, o0])
+                                    out_band_acc = pl.matmul_acc(out_band_acc, out_band_a_i, out_band_w_i)
+                                out_proj_band = pl.assemble(out_proj_band, out_band_acc, [0, o0])
                         for out_core in pl.spmd(OUT_PROJ_SPMD_BLOCKS, name_hint="out_proj_band_aiv_spmd"):
                             for ob in pl.range(out_core, Q_OUT_BLOCKS, OUT_PROJ_SPMD_BLOCKS):
                                 o0 = ob * Q_OUT_CHUNK
