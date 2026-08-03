@@ -539,6 +539,7 @@ def moe_test(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    start_barrier: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -546,6 +547,7 @@ def moe_test(
     # 1-based MoE call id; multi-layer callers increment it per reused window.
     moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
+    start_barrier = pld.tensor.barrier(start_barrier)
     moe(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,
@@ -597,6 +599,7 @@ def l3_moe(
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    start_barrier_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -607,6 +610,7 @@ def l3_moe(
         data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        start_barrier = pld.window(start_barrier_buf, [N_RANKS, 1], dtype=pl.INT32)
         moe_test(
             x_hc[r], hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
             norm_w[r], gate_w[r], gate_bias[r], tid2eid[r], input_ids[r],
@@ -616,7 +620,7 @@ def l3_moe(
             shared_w2[r], shared_w2_scale[r],
             x_next[r],
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
+            routed_y_buf, combine_arrived, start_barrier,
             layer_id, num_tokens, r, pl.const(1, pl.INT32),
             device=r,
         )
