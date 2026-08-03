@@ -159,6 +159,7 @@ def _hc_pre_syncall(
     x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    start_dep: pl.TaskId,
 ):
     t_dim = pl.tensor.dim(x, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE  # pad t_dim up to whole 16-row cube tiles
@@ -195,7 +196,13 @@ def _hc_pre_syncall(
     mixx_n = tt_n * MIXX_DS           # mix_x fans over token-tile x D-slice
     pool_d = 2 * tt_n + mixx_n        # phase-D flattened pool: sinkhorn(tt_n)|mix_x(mixx_n)|write_post(tt_n)
 
-    with pl.spmd(NUM_CORES, name_hint="hc_pre_fused", sync_start=True, allow_early_resolve=True) as _hc_tid:  # inline form requires the TaskId capture
+    with pl.spmd(
+        NUM_CORES,
+        name_hint="hc_pre_fused",
+        sync_start=True,
+        deps=[start_dep],
+        allow_early_resolve=True,
+    ) as _hc_tid:  # inline form requires the TaskId capture
         core = pl.tile.get_block_idx()  # 0 .. NUM_CORES-1
 
         # ===================== PHASE A: seed (AIV) ================================
@@ -419,6 +426,7 @@ def _hc_pre_separate(
     x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    start_dep: pl.TaskId,
 ):
     """Multi-scope (separate-task) hc_pre -- the pre-#684 structure, applied to ALL T.
 
@@ -448,7 +456,8 @@ def _hc_pre_separate(
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
 
     # rms: full-K sum-of-squares per token-tile -> inv_rms (one scope, no split-K).
-    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms", allow_early_resolve=True):
+    with pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms", deps=[start_dep], allow_early_resolve=True) as _rms_tid:
+        t = pl.tile.get_block_idx()
         t0 = t * T_TILE
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(HC_DIM // RMS_K_CHUNK, stage=4):
@@ -462,7 +471,7 @@ def _hc_pre_separate(
     # region) loops the t_linear // T_TILE row-blocks internally, instead of fanning them out.
     # On-core (not create_tensor init_value=0): AICPU init serializes on the scheduler and
     # roughly doubles the decode orch window, whereas the on-core memset overlaps.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_seed", allow_early_resolve=True):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_seed", deps=[start_dep], allow_early_resolve=True):
         for ts0 in pl.range(0, t_linear, T_TILE):
             mixes_raw[ts0:ts0 + T_TILE, 0:MIX_PAD] = pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
 
@@ -637,8 +646,9 @@ def _bind_hc_pre():
             x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
             post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
             comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+            start_dep: pl.TaskId,
         ):
-            _hc_pre_separate(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
+            _hc_pre_separate(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb, start_dep)
             return x_mixed
     else:
         @pl.jit.inline
@@ -650,8 +660,9 @@ def _bind_hc_pre():
             x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
             post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
             comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+            start_dep: pl.TaskId,
         ):
-            _hc_pre_syncall(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
+            _hc_pre_syncall(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb, start_dep)
             return x_mixed
     return hc_pre
 
@@ -676,7 +687,8 @@ def hc_pre_test(
     post.bind_dynamic(0, T_DYN)
     comb.bind_dynamic(0, T_DYN)
 
-    hc_pre(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
+    start_dep = pl.system.task_dummy(deps=[])
+    hc_pre(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb, start_dep)
     return x_mixed
 
 

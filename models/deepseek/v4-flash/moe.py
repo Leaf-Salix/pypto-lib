@@ -442,6 +442,7 @@ def moe(
     my_rank: pl.Scalar[pl.INT32],
     # 1-based MoE call id for the shared flag windows (distinct from layer_id).
     moe_epoch: pl.Scalar[pl.INT32],
+    start_dep: pl.TaskId,
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     # Non-output intermediates allocate locally, in their producer's scope.
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -449,7 +450,7 @@ def moe(
     comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     hc_pre(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        x_mixed, post_ffn, comb_ffn,
+        x_mixed, post_ffn, comb_ffn, start_dep,
     )
 
     x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
@@ -539,7 +540,7 @@ def moe_test(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    start_barrier: pld.DistributedTensor[[N_RANKS], pl.INT32],
+    start_barrier: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -547,6 +548,9 @@ def moe_test(
     # 1-based MoE call id; multi-layer callers increment it per reused window.
     moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_start_barrier") as start_barrier_tid:
+        start_barrier = pld.tensor.barrier(start_barrier)
+
     moe(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,
@@ -557,7 +561,7 @@ def moe_test(
         x_next,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
         routed_y_buf, combine_arrived,
-        layer_id, num_tokens, my_rank, moe_epoch,
+        layer_id, num_tokens, my_rank, moe_epoch, start_barrier_tid,
     )
     clear_moe_signals(x_next, arrived, data_arrived, combine_arrived)
     return x_next
@@ -598,9 +602,7 @@ def l3_moe(
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    start_barrier_buf = pld.alloc_window_buffer(N_RANKS * 4)
-    start_barrier = pld.window(start_barrier_buf, [N_RANKS], dtype=pl.INT32)
-    pld.tensor.barrier(start_barrier)
+    start_barrier_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -611,6 +613,7 @@ def l3_moe(
         data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        start_barrier = pld.window(start_barrier_buf, [N_RANKS, 1], dtype=pl.INT32)
         moe_test(
             x_hc[r], hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
             norm_w[r], gate_w[r], gate_bias[r], tid2eid[r], input_ids[r],
