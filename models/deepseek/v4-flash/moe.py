@@ -539,7 +539,7 @@ def moe_test(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    start_barrier: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    start_barrier: pld.DistributedTensor[[N_RANKS], pl.INT32],
     # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -598,8 +598,8 @@ def l3_moe(
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    start_barrier_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    start_barrier = pld.window(start_barrier_buf, [N_RANKS, 1], dtype=pl.INT32)
+    start_barrier_buf = pld.alloc_window_buffer(N_RANKS * 4)
+    start_barrier = pld.window(start_barrier_buf, [N_RANKS], dtype=pl.INT32)
     pld.tensor.barrier(start_barrier)
 
     for r in pl.range(pld.world_size()):
