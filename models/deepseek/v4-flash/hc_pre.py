@@ -159,7 +159,7 @@ def _hc_pre_syncall(
     x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
-    start_dep: pl.TaskId,
+    start_dep: pl.Scalar[pl.TASK_ID],
 ):
     t_dim = pl.tensor.dim(x, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE  # pad t_dim up to whole 16-row cube tiles
@@ -426,7 +426,7 @@ def _hc_pre_separate(
     x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
-    start_dep: pl.TaskId,
+    start_dep: pl.Scalar[pl.TASK_ID],
 ):
     """Multi-scope (separate-task) hc_pre -- the pre-#684 structure, applied to ALL T.
 
@@ -646,7 +646,7 @@ def _bind_hc_pre():
             x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
             post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
             comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
-            start_dep: pl.TaskId,
+            start_dep: pl.Scalar[pl.TASK_ID],
         ):
             _hc_pre_separate(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb, start_dep)
             return x_mixed
@@ -660,7 +660,7 @@ def _bind_hc_pre():
             x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
             post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
             comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
-            start_dep: pl.TaskId,
+            start_dep: pl.Scalar[pl.TASK_ID],
         ):
             _hc_pre_syncall(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb, start_dep)
             return x_mixed

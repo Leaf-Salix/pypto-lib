@@ -442,7 +442,7 @@ def moe(
     my_rank: pl.Scalar[pl.INT32],
     # 1-based MoE call id for the shared flag windows (distinct from layer_id).
     moe_epoch: pl.Scalar[pl.INT32],
-    start_dep: pl.TaskId,
+    start_dep: pl.Scalar[pl.TASK_ID],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     # Non-output intermediates allocate locally, in their producer's scope.
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
